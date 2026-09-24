@@ -1,7 +1,7 @@
 use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::paths::ensure_owner_state_directory;
 use crate::core::trusted_core_location::{require_trusted_core_location, untrusted};
-use crate::{ClashConfig, CoreConfig, RuntimeBundle, ServiceErrorCode, WriterConfig, mihomo_ipc_path};
+use crate::{ClashConfig, CoreConfig, RemoteProvider, RuntimeBundle, ServiceErrorCode, WriterConfig, mihomo_ipc_path};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -263,6 +263,7 @@ async fn plan_runtime_refresh(
 async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml: &str) -> Result<(), ServiceError> {
     // Do not record a source that changed while it was copied.
     let mut manifest = plan.manifest.clone();
+    super::staging::archive_remote_provider_caches(runtime, &plan.retained_caches).await;
     for destination in &plan.required_deletes {
         let target = resolve_in_generation(runtime, destination)?;
         super::staging::remove_staged_file(&target)
@@ -290,6 +291,17 @@ async fn materialize_plan(runtime: &Path, plan: &super::staging::StagePlan, yaml
             manifest.assets.remove(&copy.destination);
         }
     }
+
+    let current_providers = plan
+        .manifest
+        .remote_providers
+        .iter()
+        .map(|(destination, url)| RemoteProvider {
+            destination: destination.clone(),
+            url: url.clone(),
+        })
+        .collect::<Vec<_>>();
+    super::staging::restore_remote_provider_caches(runtime, &current_providers).await;
 
     let config_path = runtime.join(RUNTIME_CONFIG_FILE_NAME);
     if let Err(error) = super::staging::commit_staged_config(runtime, &config_path, yaml, &manifest).await {
@@ -620,7 +632,7 @@ pub(super) fn invalid_asset(message: impl Into<String>) -> ServiceError {
     ServiceError::new(ServiceErrorCode::InvalidRuntimeAsset, message)
 }
 
-async fn set_private_directory_permissions(path: &Path) -> Result<(), ServiceError> {
+pub(super) async fn set_private_directory_permissions(path: &Path) -> Result<(), ServiceError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

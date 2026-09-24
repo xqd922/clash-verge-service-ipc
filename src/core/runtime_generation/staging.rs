@@ -10,6 +10,7 @@ use crate::core::auth::{AuthenticatedOwner, ServiceError};
 use crate::core::manager::CORE_MANAGER;
 use crate::{RemoteProvider, RuntimeAsset, RuntimeBundle, StageRejection, StageRuntimeOutcome};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,8 +60,12 @@ pub(super) struct StagePlan {
     pub skipped: Vec<String>,
     /// Obsolete service-managed files removed after commit.
     pub hygiene_deletes: Vec<String>,
+    /// Provider files from the previous manifest, archived by URL before this generation deletes them.
+    pub retained_caches: Vec<RemoteProvider>,
     pub manifest: RuntimeManifest,
 }
+
+const PROVIDER_URL_CACHE_DIRECTORY_NAME: &str = "provider-url-cache";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AssetSource {
@@ -114,8 +119,163 @@ pub(super) fn plan_stage(previous: &RuntimeManifest, sources: &[AssetSource], re
     // The two input maps are sorted individually, not after concatenation.
     plan.hygiene_deletes.sort();
     plan.hygiene_deletes.dedup();
+    plan.retained_caches = previous
+        .remote_providers
+        .iter()
+        .map(|(destination, url)| RemoteProvider {
+            destination: destination.clone(),
+            url: url.clone(),
+        })
+        .collect();
 
     plan
+}
+
+fn provider_url_cache_directory(generation: &Path) -> Option<PathBuf> {
+    generation
+        .parent()
+        .map(|owner_root| owner_root.join(PROVIDER_URL_CACHE_DIRECTORY_NAME))
+}
+
+fn provider_cache_file_name(url: &str) -> String {
+    Sha256::digest(url.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Copies still-present provider files outside the runtime directory, keyed by URL.
+/// A cache miss must not block switching profiles, so every failure is logged and ignored.
+pub(super) async fn archive_remote_provider_caches(generation: &Path, providers: &[RemoteProvider]) {
+    if providers.is_empty() {
+        return;
+    }
+    let Some(cache_root) = provider_url_cache_directory(generation) else {
+        tracing::warn!("Runtime generation has no parent; remote provider caches were not archived");
+        return;
+    };
+    if let Err(error) = tokio::fs::create_dir_all(&cache_root).await {
+        tracing::warn!(error = %error, "Failed to create the remote provider URL cache");
+        return;
+    }
+    if let Err(error) = super::assets::set_private_directory_permissions(&cache_root).await {
+        tracing::warn!(
+            error = %error,
+            "Failed to secure the remote provider URL cache; continuing without new permissions"
+        );
+    }
+
+    for provider in providers {
+        let source = match resolve_in_generation(generation, &provider.destination) {
+            Ok(source) => source,
+            Err(error) => {
+                tracing::warn!(
+                    destination = %provider.destination,
+                    error = %error,
+                    "Refused to archive a provider path that no longer validates"
+                );
+                continue;
+            }
+        };
+        let metadata = match tokio::fs::metadata(&source).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(
+                    destination = %provider.destination,
+                    error = %error,
+                    "Skipped archiving a provider cache that could not be read"
+                );
+                continue;
+            }
+        };
+        if !metadata.is_file() || metadata.len() == 0 {
+            continue;
+        }
+        let Some(source_path) = source.to_str() else {
+            tracing::warn!(
+                destination = %provider.destination,
+                "Skipped archiving a provider cache whose path is not UTF-8"
+            );
+            continue;
+        };
+        let cached = cache_root.join(provider_cache_file_name(&provider.url));
+        if let Err(error) = copy_staged_file(source_path, &cached).await {
+            tracing::warn!(
+                destination = %provider.destination,
+                error = %error,
+                "Failed to archive a remote provider cache"
+            );
+        }
+    }
+}
+
+/// Puts a URL's cached bytes back when the runtime file is missing or empty.
+/// A non-empty file already in the generation is left alone so a newer download wins.
+pub(super) async fn restore_remote_provider_caches(generation: &Path, providers: &[RemoteProvider]) {
+    if providers.is_empty() {
+        return;
+    }
+    let Some(cache_root) = provider_url_cache_directory(generation) else {
+        return;
+    };
+
+    for provider in providers {
+        let destination = match resolve_in_generation(generation, &provider.destination) {
+            Ok(destination) => destination,
+            Err(error) => {
+                tracing::warn!(
+                    destination = %provider.destination,
+                    error = %error,
+                    "Refused to restore a provider path that no longer validates"
+                );
+                continue;
+            }
+        };
+        match tokio::fs::metadata(&destination).await {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => continue,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    destination = %provider.destination,
+                    error = %error,
+                    "Skipped restoring a provider cache that could not be inspected"
+                );
+                continue;
+            }
+        }
+        let cached = cache_root.join(provider_cache_file_name(&provider.url));
+        let cache_is_usable = match tokio::fs::metadata(&cached).await {
+            Ok(metadata) => metadata.is_file() && metadata.len() > 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::warn!(
+                    destination = %provider.destination,
+                    error = %error,
+                    "Skipped restoring a provider cache that could not be read"
+                );
+                false
+            }
+        };
+        if !cache_is_usable {
+            continue;
+        }
+        let Some(cached_path) = cached.to_str() else {
+            tracing::warn!(
+                destination = %provider.destination,
+                "Skipped restoring a provider cache whose path is not UTF-8"
+            );
+            continue;
+        };
+        if let Err(error) = copy_staged_file(cached_path, &destination).await {
+            tracing::warn!(
+                destination = %provider.destination,
+                error = %error,
+                "Failed to restore a remote provider cache"
+            );
+        }
+    }
 }
 
 /// Validates provider destinations and rejects conflicting URLs or asset ownership.
@@ -182,6 +342,7 @@ pub(crate) async fn stage_runtime(
         }
     };
     let plan = plan_stage(&previous, &sources, &remote);
+    archive_remote_provider_caches(&generation, &plan.retained_caches).await;
 
     for destination in &plan.required_deletes {
         let target = resolve_in_generation(&generation, destination)?;
@@ -212,6 +373,8 @@ pub(crate) async fn stage_runtime(
             });
         }
     }
+
+    restore_remote_provider_caches(&generation, &remote).await;
 
     // The watchdog can replace the core without the lifecycle lock. Never commit provenance built
     // for an earlier process; force a clean restart instead.
@@ -669,5 +832,78 @@ mod tests {
         let plan = plan_stage(&previous, &[], &[]);
 
         assert_eq!(plan.hygiene_deletes, ["a.yaml", "z.yaml"]);
+    }
+
+    #[test]
+    fn leaving_a_subscription_keeps_provider_urls_for_cache_and_still_sweeps_runtime_files() {
+        let previous = manifest(&[], &[("rules/cn.mrs", "https://one.example/cn.mrs")]);
+
+        let plan = plan_stage(&previous, &[], &[]);
+
+        assert_eq!(
+            plan.retained_caches,
+            [remote("rules/cn.mrs", "https://one.example/cn.mrs")]
+        );
+        assert_eq!(plan.hygiene_deletes, ["rules/cn.mrs"]);
+        assert!(
+            plan.required_deletes.is_empty(),
+            "a file the new profile does not declare is swept later, not discarded as a url change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_file_returns_from_the_url_cache_and_an_empty_file_is_not_archived() {
+        let root = std::env::temp_dir().join(format!(
+            "provider-url-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _cleanup = RemoveOnDrop(root.clone());
+        let generation = root.join("runtime");
+        tokio::fs::create_dir_all(generation.join("rules"))
+            .await
+            .expect("runtime directory");
+        let kept = generation.join("rules").join("ads.yaml");
+        tokio::fs::write(&kept, b"rules-body").await.expect("fixture");
+        let providers = [remote("rules/ads.yaml", "https://one.example/ads.yaml")];
+
+        archive_remote_provider_caches(&generation, &providers).await;
+        tokio::fs::remove_file(&kept).await.expect("drop runtime copy");
+        restore_remote_provider_caches(&generation, &providers).await;
+
+        assert_eq!(tokio::fs::read(&kept).await.expect("restored"), b"rules-body");
+
+        let other = generation.join("rules").join("other.yaml");
+        restore_remote_provider_caches(
+            &generation,
+            &[remote("rules/other.yaml", "https://two.example/other.yaml")],
+        )
+        .await;
+        assert!(
+            tokio::fs::metadata(&other).await.is_err(),
+            "a different url must not reuse this cache"
+        );
+
+        let empty = generation.join("rules").join("empty.yaml");
+        tokio::fs::write(&empty, b"").await.expect("empty fixture");
+        let empty_provider = [remote("rules/empty.yaml", "https://one.example/empty.yaml")];
+        archive_remote_provider_caches(&generation, &empty_provider).await;
+        tokio::fs::remove_file(&empty).await.expect("drop empty runtime copy");
+        restore_remote_provider_caches(&generation, &empty_provider).await;
+        assert!(
+            tokio::fs::metadata(&empty).await.is_err(),
+            "an empty download must not become a reusable cache"
+        );
+    }
+
+    struct RemoveOnDrop(PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
