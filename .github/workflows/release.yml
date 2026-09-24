@@ -84,7 +84,7 @@ jobs:
             target: armv7-unknown-linux-gnueabihf
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: macos-latest
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
@@ -135,6 +135,10 @@ jobs:
         if: startsWith(matrix.os, 'macos')
         shell: bash
         run: |
+          if [ -z "${{ secrets.APPLE_CERTIFICATE }}" ]; then
+            echo "Apple signing secrets are not configured; publishing unsigned macOS service binaries."
+            exit 0
+          fi
           echo "${{ secrets.APPLE_CERTIFICATE }}" | base64 --decode > cert.p12
           security create-keychain -p github-actions github-actions.keychain
           security default-keychain -s github-actions.keychain
